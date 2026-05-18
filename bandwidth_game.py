@@ -12,6 +12,15 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Dict, Optional, Tuple
 
+# Cache de fuentes y superficies SRCALPHA para evitar reasignaciones en draw loops.
+_FONT_CACHE: Dict[int, "pygame.font.Font"] = {}
+def get_font(size: int) -> "pygame.font.Font":
+    f = _FONT_CACHE.get(size)
+    if f is None:
+        f = pygame.font.Font(None, size)
+        _FONT_CACHE[size] = f
+    return f
+
 # ============================================================
 # SECTION 2: CONSTANTS, COLORS, PHYSICS
 # ============================================================
@@ -1443,7 +1452,7 @@ class AntennaMount(Platform):
                     surface.blit(ring_surf, (cx - ring_size - 1, cy - ring_size - 1))
             # "INSTALL" text hint
             if int(self.glow_phase * 2) % 3 != 0:
-                hint_font = pygame.font.Font(None, 16)
+                hint_font = get_font(16)
                 hint = hint_font.render("E", True, (0, 255, 150))
                 surface.blit(hint, (cx - hint.get_width() // 2, cy - 20))
         elif self.installed:
@@ -2174,6 +2183,8 @@ class Player:
             return
         self.health -= amount
         self.invincible_timer = self.invincible_duration
+        self.combo_count = 0
+        self.combo_timer = 0
         if self.health <= 0:
             self.die()
 
@@ -2327,8 +2338,12 @@ class Player:
 
     def update(self, platforms, cables, poles, dt=1.0):
         if not self.alive:
-            self.vy += GRAVITY
+            # Cadáver: caída amortiguada hasta un piso virtual para evitar fall infinito
+            self.vy = min(self.vy + GRAVITY, MAX_FALL)
             self.y += self.vy
+            if self.y > 3000:
+                self.y = 3000
+                self.vy = 0
             return
         if self.invincible_timer > 0:
             self.invincible_timer -= 1
@@ -2351,11 +2366,13 @@ class Player:
         self.vy += GRAVITY
         if self.vy > MAX_FALL:
             self.vy = MAX_FALL
-        self.x += self.vx
-        self.y += self.vy
         self.on_ground = False
         self.on_wall = False
-        self._resolve_collisions(platforms)
+        # Resolución de colisión axis-separated (evita teleports en esquinas)
+        self.x += self.vx
+        self._resolve_collisions_axis(platforms, 'x')
+        self.y += self.vy
+        self._resolve_collisions_axis(platforms, 'y')
         if was_on_ground and not self.on_ground:
             self.coyote_timer = COYOTE_TIME
         if self.coyote_timer > 0:
@@ -2378,7 +2395,8 @@ class Player:
                 self.climbing = False
                 self.current_pole = None
 
-    def _resolve_collisions(self, platforms):
+    def _resolve_collisions_axis(self, platforms, axis):
+        # Resuelve colisiones eje por eje. axis='x' después de mover X, axis='y' después de mover Y.
         player_rect = self.get_rect()
         for plat in platforms:
             if isinstance(plat, FiberCable) or isinstance(plat, TelecomPole):
@@ -2386,37 +2404,39 @@ class Player:
             prect = plat.rect if hasattr(plat, 'rect') else plat
             if not player_rect.colliderect(prect):
                 continue
-            overlap_x_right = player_rect.right - prect.left
-            overlap_x_left = prect.right - player_rect.left
-            overlap_y_bottom = player_rect.bottom - prect.top
-            overlap_y_top = prect.bottom - player_rect.top
-            min_overlap = min(overlap_x_right, overlap_x_left, overlap_y_bottom, overlap_y_top)
-            if min_overlap == overlap_y_bottom and self.vy >= 0:
-                self.y = prect.top
-                self.vy = 0
-                self.on_ground = True
-                friction = plat.friction if hasattr(plat, 'friction') else 1.0
-                self.vx *= friction
-            elif min_overlap == overlap_y_top and self.vy < 0:
-                self.y = prect.bottom + self.height // 2
-                self.vy = 0
-            elif min_overlap == overlap_x_right:
-                self.x = prect.left - self.width // 2
+            if axis == 'x':
                 if self.vx > 0:
+                    self.x = prect.left - self.width // 2
                     self.vx = 0
-                if not self.on_ground and self.vy > 0:
-                    self.on_wall = True
-                    self.wall_dir = 1
-                    self.vy = min(self.vy, WALL_SLIDE_SPEED)
-            elif min_overlap == overlap_x_left:
-                self.x = prect.right + self.width // 2
-                if self.vx < 0:
+                    if not self.on_ground and self.vy > 0:
+                        self.on_wall = True
+                        self.wall_dir = 1
+                        self.vy = min(self.vy, WALL_SLIDE_SPEED)
+                elif self.vx < 0:
+                    self.x = prect.right + self.width // 2
                     self.vx = 0
-                if not self.on_ground and self.vy > 0:
-                    self.on_wall = True
-                    self.wall_dir = -1
-                    self.vy = min(self.vy, WALL_SLIDE_SPEED)
+                    if not self.on_ground and self.vy > 0:
+                        self.on_wall = True
+                        self.wall_dir = -1
+                        self.vy = min(self.vy, WALL_SLIDE_SPEED)
+            else:  # axis == 'y'
+                if self.vy >= 0:
+                    # Aterrizando sobre el platform
+                    self.y = prect.top
+                    self.vy = 0
+                    self.on_ground = True
+                    friction = plat.friction if hasattr(plat, 'friction') else 1.0
+                    self.vx *= friction
+                else:
+                    # Golpe de cabeza: top del jugador = bottom del platform → y = bottom + height
+                    self.y = prect.bottom + self.height
+                    self.vy = 0
             player_rect = self.get_rect()
+
+    def _resolve_collisions(self, platforms):
+        # Compatibilidad: resolución legacy en un solo paso (mantiene API para llamadores externos)
+        self._resolve_collisions_axis(platforms, 'x')
+        self._resolve_collisions_axis(platforms, 'y')
 
     def _update_anim_state(self):
         if self.on_wall:
@@ -2977,7 +2997,7 @@ class Competitor:
         win_y = truck_y + 8
         pygame.draw.rect(surface, (180, 220, 240), (win_x, win_y, cab_w - 6, 12), border_radius=2)
         pygame.draw.rect(surface, (30, 30, 30), (win_x, win_y, cab_w - 6, 12), 1, border_radius=2)
-        font = pygame.font.Font(None, 16)
+        font = get_font(16)
         brand_text = font.render(self.brand, True, WHITE)
         text_x = sx + self.width // 2 - brand_text.get_width() // 2
         text_y = truck_y + self.height // 2 - brand_text.get_height() // 2 + 2
@@ -3215,7 +3235,7 @@ class InstallationMinigame:
                          (good_x, meter_y + meter_h + 5), 2)
         dbm_text = self.font_small.render(f"{self.signal_dbm:.1f} dBm", True, WHITE)
         surface.blit(dbm_text, (WIDTH // 2 - dbm_text.get_width() // 2, meter_y + meter_h + 10))
-        label_font = pygame.font.Font(None, 18)
+        label_font = get_font(18)
         labels = [("-90", 0.0), ("-75", 0.375), ("-65", 0.625), ("-50", 1.0)]
         for label_text, frac in labels:
             lx = meter_x + int(meter_w * frac)
@@ -3641,7 +3661,7 @@ class InstallPoint:
             alpha = int(100 * pulse)
             pygame.draw.circle(ring_surf, (*glow_color, alpha), (ring_r + 2, ring_r + 2), ring_r, 2)
             surface.blit(ring_surf, (sx - ring_r - 2, sy - 52 - ring_r - 2))
-            font = pygame.font.Font(None, 20)
+            font = get_font(20)
             prompt = font.render("E", True, glow_color)
             surface.blit(prompt, (sx - prompt.get_width() // 2, sy - 70))
         else:
@@ -4223,7 +4243,8 @@ class HUD:
         q_txt = self.font_small.render("Q", True, WHITE)
         surface.blit(q_txt, (cx - q_txt.get_width() // 2, cy - q_txt.get_height() // 2))
 
-    def draw(self, surface, player, time_remaining, city_name, level_num, signal_level=0.8):
+    def draw(self, surface, player, time_remaining, city_name, level_num, signal_level=0.8,
+             install_points=None, camera=None):
         self._draw_signal_bars(surface, signal_level)
         self._draw_score(surface)
         self._draw_time(surface, time_remaining)
@@ -4232,6 +4253,46 @@ class HUD:
         self._draw_city_level(surface, city_name, level_num)
         self._draw_special_cooldown(surface, player.character.special_cooldown,
                                      player.character.special_cooldown_max)
+        if install_points and camera is not None:
+            self._draw_waypoint(surface, player, install_points, camera)
+        if player.combo_count >= 2:
+            self._draw_combo(surface, player.combo_count)
+
+    def _draw_waypoint(self, surface, player, install_points, camera):
+        # Flecha que apunta al InstallPoint no completado más cercano, en el borde del HUD.
+        targets = [ip for ip in install_points if not getattr(ip, 'completed', False)]
+        if not targets:
+            return
+        nearest = min(targets, key=lambda ip: (ip.x - player.x) ** 2 + (ip.y - player.y) ** 2)
+        # Convertir a coords de pantalla
+        cam_x = getattr(camera, 'x', 0)
+        cam_y = getattr(camera, 'y', 0)
+        tx_screen = nearest.x - cam_x
+        ty_screen = nearest.y - cam_y
+        # Solo mostrar la flecha si el objetivo está fuera del viewport visible (~80% del frame)
+        margin = 80
+        if margin < tx_screen < WIDTH - margin and margin < ty_screen < HEIGHT - margin:
+            return
+        cx, cy = WIDTH / 2, HEIGHT / 2
+        dx = tx_screen - cx
+        dy = ty_screen - cy
+        ang = math.atan2(dy, dx)
+        edge_x = cx + math.cos(ang) * (WIDTH / 2 - 60)
+        edge_y = cy + math.sin(ang) * (HEIGHT / 2 - 60)
+        pulse = 0.7 + 0.3 * math.sin(pygame.time.get_ticks() / 200)
+        color = (int(SIGNAL_GOOD[0] * pulse), int(SIGNAL_GOOD[1] * pulse), int(SIGNAL_GOOD[2] * pulse))
+        pts = [
+            (edge_x + 22 * math.cos(ang), edge_y + 22 * math.sin(ang)),
+            (edge_x + 10 * math.cos(ang + 2.4), edge_y + 10 * math.sin(ang + 2.4)),
+            (edge_x + 5 * math.cos(ang + math.pi), edge_y + 5 * math.sin(ang + math.pi)),
+            (edge_x + 10 * math.cos(ang - 2.4), edge_y + 10 * math.sin(ang - 2.4)),
+        ]
+        pygame.draw.polygon(surface, color, [(int(p[0]), int(p[1])) for p in pts])
+
+    def _draw_combo(self, surface, combo_count):
+        self._init_fonts()
+        txt = self.font_medium.render(f"x{combo_count} COMBO", True, (255, 220, 80))
+        surface.blit(txt, (WIDTH // 2 - txt.get_width() // 2, 60))
 
 
 # ============================================================
@@ -4788,7 +4849,7 @@ class MainMenuScreen:
                          (0, 0, glow_surf.get_width(), glow_surf.get_height()), border_radius=10)
         surface.blit(glow_surf, (tx - 10, ty - 10))
         surface.blit(title_surf, (tx, ty))
-        subtitle_font = pygame.font.Font(None, 24)
+        subtitle_font = get_font(24)
         sub = subtitle_font.render("A WISP Telecom Platformer", True, GRAY)
         surface.blit(sub, (WIDTH // 2 - sub.get_width() // 2, ty + 65))
         for i, opt_key in enumerate(self.options):
@@ -6195,8 +6256,17 @@ class Game:
                                 break
                     if result == "EXCELLENT":
                         self.progression.record_excellent()
+                        # Combo: cada EXCELLENT consecutivo en ventana corta sube el contador
+                        self.player.combo_count += 1
+                        self.player.combo_timer = 180  # 3s @ 60fps
+                        # Pequeño shake + ráfaga de partículas para celebración visible
+                        if hasattr(self, 'camera') and hasattr(self.camera, 'shake'):
+                            self.camera.shake(4)
+                        for _ in range(14):
+                            self.particles.emit_signal(self.player.x, self.player.y - 30, SIGNAL_GOOD)
                     else:
                         self.progression.record_not_excellent()
+                        self.player.combo_count = 0
                     self.particles.emit_signal(self.player.x, self.player.y - 30,
                                                SIGNAL_GOOD if result == "EXCELLENT" else YELLOW)
 
@@ -6332,6 +6402,8 @@ class Game:
                     else:
                         self.player.take_damage(20)
                         self.level_damage_taken = True
+                        if hasattr(self, 'camera') and hasattr(self.camera, 'shake'):
+                            self.camera.shake(8)
             for jammer in self.current_level.jammers:
                 jammer.update(dt)
                 if jammer.alive:
@@ -6343,6 +6415,10 @@ class Game:
                         if not jammer.alive:
                             self.player.score += JAMMER_DESTROYED
                             self.progression.record_jammer_kill()
+                            if hasattr(self, 'camera') and hasattr(self.camera, 'shake'):
+                                self.camera.shake(6)
+                            for _ in range(12):
+                                self.particles.emit_spark(jammer.x, jammer.y - jammer.height)
             for npc in self.current_level.npcs:
                 npc.update(dt)
                 npc.check_proximity(self.player.x, self.player.y)
@@ -6535,7 +6611,9 @@ class Game:
                 surface.blit(arrow_txt, (ex + 10, ey + 30))
         city_name = CITY_DATA.get(self.current_city_idx, CITY_DATA[0])["name"]
         self.hud.draw(surface, self.player, self.time_remaining,
-                      city_name, self.current_level_num, self.signal_level)
+                      city_name, self.current_level_num, self.signal_level,
+                      install_points=getattr(self.current_level, 'install_points', None),
+                      camera=self.camera)
 
     def _render_boss_gameplay(self, surface):
         if not self.current_level:
